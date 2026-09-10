@@ -1,32 +1,31 @@
 package main
 
 import (
-	"fmt"
+	"log"
+	"net/http"
 	"time"
 
 	"github.com/shubhams01/cachefy/internal/cache"
+	cachehttp "github.com/shubhams01/cachefy/internal/http"
 )
 
 func main() {
-	c := cache.New(100)
-
+	c := cache.New(10000)
 	defer c.Close()
 
-	err := c.Set(
-		"hello",
-		[]byte("Cachefy"),
-		5*time.Minute,
-	)
+	handler := cachehttp.NewHandler(c)
 
-	if err != nil {
-		panic(err)
+	server := &http.Server{
+		Addr:              ":8080",
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	value, err := c.Get("hello")
+	log.Println("Cachefy listening on :8080")
 
-	if err != nil {
-		panic(err)
+	if err := server.ListenAndServe(); err != nil {
+		if err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
 	}
-
-	fmt.Println(string(value))
 }
