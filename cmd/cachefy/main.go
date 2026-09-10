@@ -8,15 +8,22 @@ import (
 )
 
 func main() {
-	c := cache.New()
+	c := cache.New(100)
 
-	c.Set(
-		"message",
-		[]byte("Hello from Cachefy"),
-		10*time.Second,
+	defer c.Close()
+
+	err := c.Set(
+		"hello",
+		[]byte("Cachefy"),
+		5*time.Minute,
 	)
 
-	value, err := c.Get("message")
+	if err != nil {
+		panic(err)
+	}
+
+	value, err := c.Get("hello")
+
 	if err != nil {
 		panic(err)
 	}
