@@ -2,6 +2,7 @@ package cache
 
 import (
 	"errors"
+	"hash/fnv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -10,6 +11,10 @@ import (
 var (
 	ErrKeyNotFound = errors.New("key not found")
 	ErrCacheClosed = errors.New("cache is closed")
+)
+
+const (
+	defaultShardCount = 32
 )
 
 type Entry struct {
@@ -27,9 +32,7 @@ type Stats struct {
 }
 
 type Cache struct {
-	mu sync.Mutex
-
-	lru *lru
+	shards []*shard
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -49,15 +52,47 @@ func New(capacity int) *Cache {
 		capacity = 1
 	}
 
+	shardCount := defaultShardCount
+
+	if capacity < shardCount {
+		shardCount = capacity
+	}
+
+	shards := make([]*shard, shardCount)
+
+	baseCapacity := capacity / shardCount
+	remainder := capacity % shardCount
+
+	for i := 0; i < shardCount; i++ {
+		shardCapacity := baseCapacity
+
+		if i < remainder {
+			shardCapacity++
+		}
+
+		shards[i] = newShard(shardCapacity)
+	}
+
 	c := &Cache{
-		lru:    newLRU(capacity),
+		shards: shards,
 		stopCh: make(chan struct{}),
 	}
 
 	c.wg.Add(1)
+
 	go c.expirationWorker()
 
 	return c
+}
+
+func (c *Cache) getShard(key string) *shard {
+	hash := fnv.New32a()
+
+	_, _ = hash.Write([]byte(key))
+
+	index := int(hash.Sum32() % uint32(len(c.shards)))
+
+	return c.shards[index]
 }
 
 func (c *Cache) Set(key string, value []byte, ttl time.Duration) error {
@@ -71,8 +106,6 @@ func (c *Cache) Set(key string, value []byte, ttl time.Duration) error {
 		expiresAt = time.Now().Add(ttl)
 	}
 
-	// Copy the value so callers cannot mutate cached data
-	// after Set returns.
 	valueCopy := make([]byte, len(value))
 	copy(valueCopy, value)
 
@@ -81,14 +114,9 @@ func (c *Cache) Set(key string, value []byte, ttl time.Duration) error {
 		ExpiresAt: expiresAt,
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	shard := c.getShard(key)
 
-	if c.closed.Load() {
-		return ErrCacheClosed
-	}
-
-	evicted := c.lru.set(key, entry)
+	evicted := shard.set(key, entry)
 
 	c.sets.Add(1)
 
@@ -104,22 +132,18 @@ func (c *Cache) Get(key string) ([]byte, error) {
 		return nil, ErrCacheClosed
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	shard := c.getShard(key)
 
-	if c.closed.Load() {
-		return nil, ErrCacheClosed
-	}
-
-	entry, ok := c.lru.get(key)
+	entry, ok := shard.get(key)
 
 	if !ok {
 		c.misses.Add(1)
+
 		return nil, ErrKeyNotFound
 	}
 
 	if !entry.ExpiresAt.IsZero() && time.Now().After(entry.ExpiresAt) {
-		c.lru.delete(key)
+		shard.delete(key)
 
 		c.misses.Add(1)
 		c.expirations.Add(1)
@@ -140,14 +164,9 @@ func (c *Cache) Delete(key string) error {
 		return ErrCacheClosed
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	shard := c.getShard(key)
 
-	if c.closed.Load() {
-		return ErrCacheClosed
-	}
-
-	if c.lru.delete(key) {
+	if shard.delete(key) {
 		c.deletes.Add(1)
 	}
 
@@ -159,17 +178,17 @@ func (c *Cache) Exists(key string) bool {
 		return false
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	shard := c.getShard(key)
 
-	entry, ok := c.lru.get(key)
+	entry, ok := shard.get(key)
 
 	if !ok {
 		return false
 	}
 
 	if !entry.ExpiresAt.IsZero() && time.Now().After(entry.ExpiresAt) {
-		c.lru.delete(key)
+		shard.delete(key)
+
 		c.expirations.Add(1)
 
 		return false
@@ -183,16 +202,11 @@ func (c *Cache) Clear() error {
 		return ErrCacheClosed
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	var count int
 
-	if c.closed.Load() {
-		return ErrCacheClosed
+	for _, shard := range c.shards {
+		count += shard.clear()
 	}
-
-	count := c.lru.len()
-
-	c.lru.clear()
 
 	c.deletes.Add(uint64(count))
 
@@ -234,15 +248,11 @@ func (c *Cache) removeExpired() {
 
 	now := time.Now()
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	for _, shard := range c.shards {
+		count := shard.removeExpired(now)
 
-	for key, element := range c.lru.items {
-		entry := element.Value.(*lruEntry).entry
-
-		if !entry.ExpiresAt.IsZero() && now.After(entry.ExpiresAt) {
-			c.lru.delete(key)
-			c.expirations.Add(1)
+		if count > 0 {
+			c.expirations.Add(uint64(count))
 		}
 	}
 }
@@ -253,5 +263,6 @@ func (c *Cache) Close() {
 	}
 
 	close(c.stopCh)
+
 	c.wg.Wait()
 }

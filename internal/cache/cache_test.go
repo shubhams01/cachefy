@@ -2,6 +2,7 @@ package cache
 
 import (
 	"errors"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -280,5 +281,30 @@ func TestCacheClose(t *testing.T) {
 
 	if !errors.Is(err, ErrCacheClosed) {
 		t.Fatalf("expected ErrCacheClosed, got %v", err)
+	}
+}
+
+func TestCacheShardDistribution(t *testing.T) {
+	c := New(320)
+	defer c.Close()
+
+	if len(c.shards) != 32 {
+		t.Fatalf("expected 32 shards, got %d", len(c.shards))
+	}
+
+	for i := 0; i < 320; i++ {
+		key := "key-" + strconv.Itoa(i)
+
+		if err := c.Set(key, []byte("value"), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for i := 0; i < 320; i++ {
+		key := "key-" + strconv.Itoa(i)
+
+		if !c.Exists(key) {
+			t.Fatalf("expected %s to exist", key)
+		}
 	}
 }
